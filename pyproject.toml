@@ -1,0 +1,20 @@
+[project]
+name = "ucla-24"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cairosvg>=2.9.0",
+    "openai-whisper>=20250625",
+    "opencv-python>=4.13.0.92",
+    "pandas>=3.0.1",
+    "praatio>=6.2.2",
+    "pycairo>=1.29.0",
+    "pydub>=0.25.1",
+    "pysrt>=1.1.2",
+    "soundfile>=0.13.1",
+    "spacy-stanza>=1.0.4",
+    "srt>=3.5.3",
+    "whisperx>=3.8.2",
+]

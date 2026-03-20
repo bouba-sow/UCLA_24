@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# mfa data
+data/mfa_data/
+data/mfa_output/
+
+# slurm logs
+*.out
+
+# trash
+trash/
+
+# Virtual environments
+.venv
+
+# NeMo
+NeMo/
+
+# videos and audios
+*.mp4
+*.avi
+*.m4v
+*.wav
+
+# output
+output/
