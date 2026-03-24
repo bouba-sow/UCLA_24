@@ -33,18 +33,29 @@ from PIL import Image
 # 2. Setup spacy-stanza
 nlp = spacy_stanza.load_pipeline("en", processors='tokenize,pos,lemma,depparse', use_gpu=True)
 
-VIDEO_PATH = "/store/scratch/bsow/Documents/UCLA_24/data/40m_act_24_S06E01_30fps_subtitled_marked.mp4"
-SRT_PATH = "/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01.srt"
-OUTPUT_PATH = "24_S06E01_Linguistic_Analysis.mp4"
+VIDEO_PATH = "data/40m_act_24_S06E01_30fps_subtitled.mp4"
+SRT_PATH = "data/24_S06E01.srt"
+OUTPUT_PATH = "output/24_S06E01_Linguistic_Analysis.mp4"
 
-def render_dep_tree(text, width):
-    """Converts a sentence into a PNG image of its dependency tree."""
+def render_dep_tree(text, width, max_height):
     doc = nlp(text)
-    options = {"compact": True, "color": "white", "bg": "#00000000", "font": "Arial"}
+
+    options = {
+        "compact": True,
+        "color": "white",
+        "bg": "#00000000",
+        "font": "Arial"
+    }
+
     svg_data = displacy.render(doc, style="dep", jupyter=False, options=options)
-    
-    # Scale width to match video width
-    png_data = cairosvg.svg2png(bytestring=svg_data.encode('utf-8'), output_width=width)
+
+    # 🔥 Render at correct scale directly
+    png_data = cairosvg.svg2png(
+        bytestring=svg_data.encode('utf-8'),
+        output_width=width,
+        output_height=max_height  # ← KEY FIX
+    )
+
     img = Image.open(io.BytesIO(png_data)).convert("RGBA")
     return np.array(img)
 
@@ -79,22 +90,16 @@ def process_video():
                 
                 # ONLY render if the text has changed
                 if clean_text != last_rendered_text:
-                    cached_tree = render_dep_tree(clean_text, width=w)
+                    MAX_OVERLAY_HEIGHT = int(h * 0.35)  # 35% of screen
+                    cached_tree = render_dep_tree(
+                        clean_text,
+                        width=w,
+                        max_height=MAX_OVERLAY_HEIGHT
+                    )
                     last_rendered_text = clean_text
                 
                 # Overlay logic
                 overlay_h, overlay_w = cached_tree.shape[:2]
-
-                # ✅ Ensure overlay fits inside frame
-                max_h, max_w = frame.shape[:2]
-
-                scale = min(max_w / overlay_w, max_h / overlay_h, 1.0)
-
-                if scale < 1.0:
-                    new_w = int(overlay_w * scale)
-                    new_h = int(overlay_h * scale)
-                    cached_tree = cv2.resize(cached_tree, (new_w, new_h))
-                    overlay_h, overlay_w = cached_tree.shape[:2]
 
                 # ✅ Now guaranteed to fit
                 alpha = cached_tree[:, :, 3] / 255.0
@@ -114,7 +119,33 @@ def process_video():
 
     cap.release()
     out.release()
-    print(f"Success! Output: {OUTPUT_PATH}")
+    import subprocess
+    import os
+
+    print("Embedding subtitles into final video...")
+
+    temp_output = OUTPUT_PATH.replace(".mp4", "_temp.mp4")
+
+    # Rename current output temporarily
+    os.rename(OUTPUT_PATH, temp_output)
+
+    # Run ffmpeg to add subtitles
+    cmd = [
+        "ffmpeg",
+        "-y",  # overwrite
+        "-i", temp_output,
+        "-i", SRT_PATH,
+        "-c", "copy",
+        "-c:s", "mov_text",
+        OUTPUT_PATH
+    ]
+
+    subprocess.run(cmd, check=True)
+
+    # Remove temp file
+    os.remove(temp_output)
+
+    print(f"Final video with subtitles: {OUTPUT_PATH}")
 
 if __name__ == "__main__":
     process_video()
