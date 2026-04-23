@@ -1,6 +1,6 @@
-24_S04E01_8concepts_merged_README.txt
+24_S06E01_8concepts_merged_README.txt
 
-24_S04E01_8concepts_merged.csv contains labels for 8 concepts (one per column) in the first episode of season 4 of the TV show 24. These labels were used to train transformer models in the Ding, Dunn, Sakon et al. paper.
+24_S04=6E01_8concepts_merged.csv contains labels for 8 concepts (one per column) in the first episode of season 4 of the TV show 24. These labels were used to train transformer models in the Ding, Dunn, Sakon et al. paper.
 
 The labels have 1 second resolution.
 

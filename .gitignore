@@ -30,3 +30,8 @@ NeMo/
 
 # output
 output/
+
+# data
+data/ucla_data/
+data/bids/
+data/bids2/
