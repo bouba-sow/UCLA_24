@@ -3,7 +3,7 @@ name = "ucla-24"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "cairosvg>=2.9.0",
     "h5py>=3.16.0",
@@ -25,6 +25,7 @@ dependencies = [
     "srt>=3.5.3",
     "torch>=2.8.0",
     "torchcrepe>=0.0.24",
+    "torchvision>=0.23.0",
     "whisperx>=3.8.2",
     "wordfreq>=3.1.1",
 ]

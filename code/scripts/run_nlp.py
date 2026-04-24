@@ -1,332 +1,382 @@
-import numpy as np
-import torch
-
-try:
-    torch.serialization.add_safe_globals([
-        np.core.multiarray._reconstruct,  # the function
-        np.ndarray,                        # the class
-        np.dtype                            # the type
-    ])
-except Exception as e:
-    print("Fallback: disabling weights_only")
-    import torch.serialization
-    torch.serialization.default_weights_only = False
-    exit(1)
-# ✅ 2. FORCE weights_only=False globally
-_original_torch_load = torch.load
-
-def patched_torch_load(*args, **kwargs):
-    if "weights_only" not in kwargs:
-        kwargs["weights_only"] = False
-    return _original_torch_load(*args, **kwargs)
-
-torch.load = patched_torch_load
-  
-import cv2
-import srt
-import spacy_stanza
-from spacy import displacy
-import cairosvg
-import io
-import re
+"""
+Updated feature extraction for 24_S06E01 (paper-aligned where possible)
+- Biphone surprisal currently disabled
+- Uses Hilbert + Butterworth envelope pipeline
+- Uses torchcrepe pitch pipeline with 100 ms smoothing
+- Uses wordfreq Zipf scores for word frequency
+"""
+import sys
+from bisect import bisect_right
 from collections import Counter
-from PIL import Image
+from pathlib import Path
+import re
 
-# 2. Setup spacy-stanza
-nlp = spacy_stanza.load_pipeline("en", processors='tokenize,pos,lemma,depparse', use_gpu=True)
+import torch
+try:
+    import torchcrepe
+except ImportError as exc:
+    raise ImportError(
+        "torchcrepe is required for pitch extraction. Install it in your env (e.g., `uv pip install torchcrepe`)."
+    ) from exc
 
-VIDEO_PATH = "data/40m_act_24_S06E01_30fps_subtitled_marked.mp4"
-SRT_PATH = "data/24_S06E01.srt"
-OUTPUT_PATH = "24_S06E01_Linguistic_Analysis.mp4"
+import librosa
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, find_peaks, hilbert
+from wordfreq import zipf_frequency
 
-# Overlay placement tuning.
-TREE_TOP_OFFSET_PX = 90     # leave space for character/concept labels at top
-TREE_LEFT_MARGIN_PX = 10
-TREE_MAX_WIDTH_RATIO = 0.95
-TREE_MAX_HEIGHT_RATIO = 0.58
-LEX_PANEL_MARGIN_PX = 12
-LEX_PANEL_GAP_FROM_TREE_PX = 10
-LEX_PANEL_HEIGHT_PX = 88
-LEX_CELL_MIN_WIDTH_PX = 24
-LEX_CELL_GOOD_WIDTH_PX = 44
+# Paths
+phoneme_csv = Path('/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_phonemes.csv')
+word_csv = Path('/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_words.csv')
+srt_path = Path('/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01.srt')
+audio_path = Path('/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01.wav')
+out_csv = Path('/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_events_vowel_word_features.csv')
 
-TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+# Audio constants
+TARGET_SR = 16_000
+HOP_MS = 10
+WINDOW_MS = 100
+HOP_SAMPLES = int(HOP_MS / 1000 * TARGET_SR)
+N_FFT = int(WINDOW_MS / 1000 * TARGET_SR)
+N_MELS = 16
+ENV_BANDPASS_LOW_HZ = 1.0
+ENV_BANDPASS_HIGH_HZ = 10.0
+PITCH_SMOOTH_MS = 100
+CREPE_CONF_THRESHOLD = 0.5
 
-def build_subtitle_frequency_profile(subs):
-    """Builds corpus word-frequency stats from the subtitle file."""
-    counts = Counter()
-    for sub in subs:
-        text = sub.content.replace("\n", " ").lower()
-        counts.update(TOKEN_PATTERN.findall(text))
-    total_tokens = sum(counts.values()) or 1
-    return counts, total_tokens
 
-def token_frequency_score(token, freq_counts, total_tokens):
-    """
-    Returns a simple Zipf-like score (log10 per million + 1) from subtitle corpus.
-    This is a fallback when external corpora are not available.
-    """
-    raw_count = freq_counts.get(token.lower(), 0)
-    ppm = (raw_count / total_tokens) * 1_000_000.0
-    return np.log10(ppm + 1.0)
+def srt_time_to_seconds(ts: str) -> float:
+    hh, mm, rest = ts.split(':')
+    ss, ms = rest.split(',')
+    return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
 
-def extract_lexical_features(doc, freq_counts, total_tokens):
-    """Extracts lexical rows: word, length, frequency score."""
+
+def parse_srt(file_path: Path) -> pd.DataFrame:
+    txt = file_path.read_text(encoding='utf-8')
+    blocks = [b.strip() for b in txt.split('\n\n') if b.strip()]
     rows = []
-    for token in doc:
-        txt = token.text.strip()
-        if not txt:
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 3 or '-->' not in lines[1]:
             continue
-        match = TOKEN_PATTERN.search(txt)
-        if not match:
-            continue
-        clean = match.group(0)
+        start_txt, end_txt = [x.strip() for x in lines[1].split('-->')]
         rows.append(
             {
-                "word": clean,
-                "length": len(clean),
-                "freq": token_frequency_score(clean, freq_counts, total_tokens),
+                'start': srt_time_to_seconds(start_txt),
+                'end': srt_time_to_seconds(end_txt),
+                'text': ' '.join(lines[2:]).strip(),
             }
         )
-    return rows
+    return pd.DataFrame(rows).sort_values('start').reset_index(drop=True)
 
-def boxes_intersect(box_a, box_b):
-    """Returns True if two (x1, y1, x2, y2) boxes intersect."""
-    return not (
-        box_a[2] <= box_b[0]
-        or box_a[0] >= box_b[2]
-        or box_a[3] <= box_b[1]
-        or box_a[1] >= box_b[3]
-    )
 
-def draw_lexical_panel(frame, lexical_rows, tree_bbox=None):
-    """Draws a horizontal lexical table: word / len / freq."""
-    if not lexical_rows:
-        return
+def normalize_token(x: str) -> str:
+    return re.sub(r"[^\w']+", '', str(x).lower())
 
-    h, w = frame.shape[:2]
-    x1 = LEX_PANEL_MARGIN_PX
-    x2 = w - LEX_PANEL_MARGIN_PX
-    panel_w = x2 - x1
-    if panel_w <= 120:
-        return
 
-    panel_h = LEX_PANEL_HEIGHT_PX
-    if tree_bbox is not None:
-        y1 = tree_bbox[3] + LEX_PANEL_GAP_FROM_TREE_PX
+def minmax01(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    finite = np.isfinite(x)
+    out = np.zeros_like(x)
+    if finite.any():
+        lo, hi = np.nanmin(x[finite]), np.nanmax(x[finite])
+        out[finite] = (x[finite] - lo) / (hi - lo + 1e-8)
+    return out
+
+
+def onset_and_duration(
+    series: pd.Series,
+    is_valid,
+    frame_time: np.ndarray,
+    frame_dt: float,
+) -> tuple[pd.Series, pd.Series]:
+    onset_label = pd.Series('', index=series.index, dtype=object)
+    onset_duration = pd.Series(0.0, index=series.index, dtype=float)
+    n = len(series)
+    i = 0
+    while i < n:
+        label = series.iat[i]
+        if not is_valid(label):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and series.iat[j + 1] == label:
+            j += 1
+        onset_label.iat[i] = str(label)
+        onset_duration.iat[i] = float((frame_time[j] + frame_dt) - frame_time[i])
+        i = j + 1
+    return onset_label, onset_duration
+
+
+def align(source_values: np.ndarray, source_times: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+    source_values = np.asarray(source_values, dtype=float)
+    source_times = np.asarray(source_times, dtype=float)
+    target_times = np.asarray(target_times, dtype=float)
+
+    if source_values.ndim != 1 or source_times.ndim != 1 or target_times.ndim != 1:
+        raise ValueError('align expects 1-D arrays')
+    if len(source_values) != len(source_times):
+        raise ValueError('source_values and source_times must have the same length')
+    if len(source_values) == 0 or len(target_times) == 0:
+        return np.zeros(len(target_times), dtype=float)
+    if np.any(np.diff(source_times) < 0) or np.any(np.diff(target_times) < 0):
+        raise ValueError('source_times and target_times must be monotonic non-decreasing')
+
+    n_target = len(target_times)
+    out = np.zeros(n_target, dtype=float)
+
+    frame_dt_target = float(np.median(np.diff(target_times))) if n_target > 1 else 0.0
+    edges = np.empty(n_target + 1)
+    if n_target > 1:
+        edges[1:-1] = 0.5 * (target_times[:-1] + target_times[1:])
+        edges[0] = target_times[0] - 0.5 * frame_dt_target
+        edges[-1] = target_times[-1] + 0.5 * frame_dt_target
     else:
-        y1 = h - panel_h - LEX_PANEL_MARGIN_PX
-    y2 = y1 + panel_h
+        edges[0] = target_times[0] - 0.5
+        edges[-1] = target_times[0] + 0.5
 
-    # Keep panel in frame if tree is too low.
-    if y2 > h - LEX_PANEL_MARGIN_PX:
-        y2 = h - LEX_PANEL_MARGIN_PX
-        y1 = y2 - panel_h
-    if y1 < LEX_PANEL_MARGIN_PX:
-        y1 = LEX_PANEL_MARGIN_PX
-        y2 = y1 + panel_h
+    bin_idx = np.searchsorted(edges, source_times, side='right') - 1
+    counts = np.zeros(n_target, dtype=float)
 
-    # Semi-transparent dark panel.
-    panel_region = frame[y1:y2, x1:x2].copy()
-    dark_bg = np.zeros_like(panel_region)
-    frame[y1:y2, x1:x2] = cv2.addWeighted(panel_region, 0.40, dark_bg, 0.60, 0.0)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+    for src_i, b in enumerate(bin_idx):
+        if 0 <= b < n_target:
+            out[b] += source_values[src_i]
+            counts[b] += 1.0
 
-    label_w = 44
-    left_pad = 6
-    right_pad = 6
-    data_w = max(1, panel_w - label_w - left_pad - right_pad)
-    max_visible = max(1, data_w // LEX_CELL_MIN_WIDTH_PX)
-    target_visible = min(len(lexical_rows), max_visible)
-    cell_w = max(LEX_CELL_MIN_WIDTH_PX, data_w // target_visible)
-    good_visible = max(1, data_w // LEX_CELL_GOOD_WIDTH_PX)
-
-    rows_to_draw = lexical_rows[:target_visible]
-    truncated_count = max(0, len(lexical_rows) - target_visible)
-
-    y_word = y1 + 24
-    y_len = y1 + 50
-    y_freq = y1 + 76
-    label_color = (0, 255, 255)
-    data_color = (230, 230, 230)
-
-    cv2.putText(frame, "word", (x1 + left_pad, y_word), cv2.FONT_HERSHEY_SIMPLEX, 0.42, label_color, 1, cv2.LINE_AA)
-    cv2.putText(frame, "len",  (x1 + left_pad, y_len),  cv2.FONT_HERSHEY_SIMPLEX, 0.42, label_color, 1, cv2.LINE_AA)
-    cv2.putText(frame, "freq", (x1 + left_pad, y_freq), cv2.FONT_HERSHEY_SIMPLEX, 0.42, label_color, 1, cv2.LINE_AA)
-
-    data_x_start = x1 + label_w
-    word_char_limit = 10 if target_visible <= good_visible else 6
-    word_font = 0.38 if target_visible <= good_visible else 0.33
-
-    for idx, row in enumerate(rows_to_draw):
-        x = data_x_start + idx * cell_w
-        word_text = row["word"][:word_char_limit]
-        cv2.putText(frame, word_text, (x, y_word), cv2.FONT_HERSHEY_SIMPLEX, word_font, data_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, str(row["length"]), (x, y_len), cv2.FONT_HERSHEY_SIMPLEX, 0.36, data_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"{row['freq']:.2f}", (x, y_freq), cv2.FONT_HERSHEY_SIMPLEX, 0.36, data_color, 1, cv2.LINE_AA)
-
-    if truncated_count > 0:
-        cv2.putText(
-            frame,
-            f"+{truncated_count} more",
-            (x2 - 110, y_freq),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.34,
-            (180, 180, 180),
-            1,
-            cv2.LINE_AA,
+    empty = counts == 0
+    if empty.any():
+        out[empty] = np.interp(
+            target_times[empty], source_times, source_values,
+            left=float(source_values[0]), right=float(source_values[-1])
         )
+        counts[empty] = 1.0
 
-def render_dep_tree(doc, max_width, max_height):
-    """Converts a sentence into a readable PNG dependency tree."""
-    token_count = len([t for t in doc if not t.is_space])
+    out /= counts
+    return out
 
-    # Large trees become blurry when rasterized directly to the target width.
-    # Render bigger first, then downsample with high-quality filters.
-    supersample = 3 if token_count <= 18 else 4
 
-    options = {
-        "compact": token_count >= 20,
-        "color": "white",
-        "bg": "#00000000",
-        "font": "Arial",
-        "distance": 120 if token_count <= 16 else 100 if token_count <= 24 else 85,
+# Load tabular data
+phon = pd.read_csv(phoneme_csv)
+words = pd.read_csv(word_csv)
+subs = parse_srt(srt_path)
+
+if len(phon) != len(words):
+    raise ValueError(f'Row mismatch: phonemes={len(phon)}, words={len(words)}')
+if not np.allclose(phon['time'].to_numpy(), words['time'].to_numpy()):
+    raise ValueError('Time columns not aligned between phoneme and word CSVs.')
+
+frame_time = phon['time'].to_numpy(dtype=float)
+frame_dt = float(np.median(np.diff(frame_time)))
+
+phoneme_cols = [c for c in phon.columns if c not in ('frame', 'time')]
+frame_phoneme = phon[phoneme_cols].idxmax(axis=1)
+
+vowel_chars = set('aeiouAEIOUæɑɒɔəɛɜɪʊʉɐɚ')
+diphthongs = {'aj', 'aw', 'ej', 'ow', 'əw', 'ɔj'}
+non_speech_tokens = {'sil', 'spn'}
+vowel_labels = {
+    ph for ph in phoneme_cols
+    if (ph in diphthongs or any(ch in vowel_chars for ch in ph)) and ph not in non_speech_tokens
+}
+
+# Section 1 — onsets and lexical/prosodic tabular features
+is_valid_vowel = lambda x: isinstance(x, str) and x in vowel_labels
+vowel_onset, vowel_duration = onset_and_duration(frame_phoneme, is_valid_vowel, frame_time, frame_dt)
+
+is_valid_phoneme = lambda x: isinstance(x, str) and x not in non_speech_tokens and x != ''
+phoneme_onset, phoneme_duration = onset_and_duration(frame_phoneme, is_valid_phoneme, frame_time, frame_dt)
+
+word_series = words['word']
+is_valid_word = lambda x: not pd.isna(x) and str(x).strip().lower() not in {'none', ''}
+word_onset, word_duration = onset_and_duration(word_series, is_valid_word, frame_time, frame_dt)
+
+word_onset_mask = word_onset != ''
+onset_rows = word_onset[word_onset_mask].index.to_numpy()
+onset_words = word_onset[word_onset_mask].astype(str)
+
+word_frequency = pd.Series(0.0, index=word_series.index, dtype=float)
+for idx, token in onset_words.items():
+    word_frequency.iat[idx] = float(zipf_frequency(token, 'en'))
+
+word_char_len = pd.Series(0.0, index=word_series.index, dtype=float)
+for idx in onset_rows:
+    word_char_len.iat[idx] = len(str(word_onset.iat[idx]).strip())
+
+pause_duration_ms = pd.Series(0.0, index=word_series.index, dtype=float)
+for prev_idx, curr_idx in zip(onset_rows[:-1], onset_rows[1:]):
+    prev_end = frame_time[prev_idx] + float(word_duration.iat[prev_idx])
+    gap_ms = max(0.0, frame_time[curr_idx] - prev_end) * 1000.0
+    pause_duration_ms.iat[curr_idx] = gap_ms
+
+word_ner = pd.Series('', index=word_series.index, dtype=object)
+try:
+    import spacy
+    ner_nlp = spacy.load('en_core_web_sm')
+    subtitle_entities = []
+    for text in subs['text'].tolist():
+        doc = ner_nlp(text)
+        token_to_label = {}
+        for ent in doc.ents:
+            for tok in ent:
+                key = normalize_token(tok.text)
+                if key and key not in token_to_label:
+                    token_to_label[key] = ent.label_
+        subtitle_entities.append(token_to_label)
+
+    sub_starts = subs['start'].to_numpy(dtype=float)
+    sub_ends = subs['end'].to_numpy(dtype=float)
+    for idx in onset_rows:
+        t = float(frame_time[idx])
+        token = normalize_token(onset_words.loc[idx])
+        if not token:
+            continue
+        sub_i = bisect_right(sub_starts, t) - 1
+        if sub_i < 0 or sub_i >= len(subs):
+            continue
+        if not (sub_starts[sub_i] <= t <= sub_ends[sub_i]):
+            continue
+        word_ner.iat[idx] = subtitle_entities[sub_i].get(token, '')
+except Exception as exc:
+    print(f'NER skipped: {exc}')
+print("Finished NER")
+sys.stdout.flush()
+# Biphone surprisal disabled for now.
+# Keep the column with zeros so downstream code/schema stays stable.
+biphone_surprisal = pd.Series(0.0, index=phon.index, dtype=float)
+print('Biphone surprisal disabled: column set to 0.0 for all rows.')
+
+
+# Section 2 — audio features
+print(f'Loading audio: {audio_path}')
+y, sr = librosa.load(audio_path, sr=TARGET_SR, mono=True)
+print(f'  Duration: {len(y)/sr:.1f}s  SR: {sr}Hz')
+
+# Mel spectrogram
+mel_power = librosa.feature.melspectrogram(
+    y=y, sr=sr,
+    n_fft=N_FFT, hop_length=HOP_SAMPLES,
+    n_mels=N_MELS, fmin=0, fmax=8000, power=2.0,
+)
+mel_db = librosa.power_to_db(mel_power, ref=np.max)
+
+mel_aligned = {}
+for i in range(N_MELS):
+    band_norm = minmax01(mel_db[i])
+    band_times = librosa.times_like(band_norm, sr=TARGET_SR, hop_length=HOP_SAMPLES)
+    mel_aligned[f'mel_{i:02d}'] = align(band_norm, band_times, frame_time)
+
+# Continuous envelope (paper-style): Hilbert magnitude -> 100 Hz -> 3rd-order Butterworth 1-10 Hz band-pass
+analytic = hilbert(y)
+env_cont = np.abs(analytic)
+env_100 = env_cont[::HOP_SAMPLES]
+
+env_fs = TARGET_SR / HOP_SAMPLES  # 100 Hz
+nyq = 0.5 * env_fs
+low = max(0.01, min(ENV_BANDPASS_LOW_HZ, nyq * 0.95))
+high = max(low + 0.01, min(ENV_BANDPASS_HIGH_HZ, nyq * 0.99))
+b, a = butter(3, [low / nyq, high / nyq], btype='band')
+env_band = filtfilt(b, a, env_100)
+env_norm = minmax01(env_band)
+env_times = np.arange(len(env_norm), dtype=float) / env_fs
+env_aligned = align(env_norm, env_times, frame_time)
+
+# Envelope peak rate from local peaks in derivative (no thresholding; keep peak magnitudes)
+env_d = np.gradient(env_norm)
+peaks, _ = find_peaks(env_d)
+rate_sparse = np.zeros_like(env_norm)
+rate_sparse[peaks] = env_d[peaks]
+rate_times = env_times
+env_peak_rate_aligned = align(rate_sparse, rate_times, frame_time)
+
+# Pitch via torchcrepe
+# torchcrepe operates on torch tensors and returns frame-wise F0 at hop_length steps.
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+audio_t = torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(0)
+print("Finished audio tensor")
+sys.stdout.flush()
+pitch_t, periodicity_t = torchcrepe.predict(
+    audio_t,
+    sr,
+    HOP_SAMPLES,
+    fmin=50,
+    fmax=500,
+    model='full',
+    batch_size=1024,
+    device=device,
+    decoder=torchcrepe.decode.viterbi,
+    return_periodicity=True,
+)
+
+pitch_hz = pitch_t.squeeze(0).detach().cpu().numpy().astype(float)
+confidence = periodicity_t.squeeze(0).detach().cpu().numpy().astype(float)
+pitch_hz[confidence < CREPE_CONF_THRESHOLD] = 0.0
+
+pitch_win = max(1, int(round(PITCH_SMOOTH_MS / HOP_MS)))
+pitch_smooth = np.convolve(pitch_hz, np.ones(pitch_win) / pitch_win, mode='same')
+
+voiced_vals = pitch_smooth[pitch_smooth > 0]
+if len(voiced_vals) > 0:
+    lo5, hi95 = np.percentile(voiced_vals, 5), np.percentile(voiced_vals, 95)
+    pitch_clipped = np.clip(pitch_smooth, lo5, hi95)
+    pitch_clipped[pitch_smooth == 0] = 0.0
+    pitch_norm = minmax01(pitch_clipped)
+else:
+    pitch_norm = np.zeros_like(pitch_smooth)
+
+pitch_deriv = np.gradient(pitch_norm)
+pitch_up = np.maximum(pitch_deriv, 0.0)
+pitch_down = np.maximum(-pitch_deriv, 0.0)
+
+pitch_times = np.arange(len(pitch_smooth), dtype=float) * (HOP_SAMPLES / sr)
+pitch_hz_aligned = align(pitch_smooth, pitch_times, frame_time)
+pitch_norm_aligned = align(pitch_norm, pitch_times, frame_time)
+pitch_up_aligned = align(pitch_up, pitch_times, frame_time)
+pitch_down_aligned = align(pitch_down, pitch_times, frame_time)
+
+print('\nFeature lengths before alignment:')
+print(f'  env_norm:   {len(env_norm)}')
+print(f'  pitch_hz:   {len(pitch_smooth)}')
+print(f'  mel band 0: {mel_db.shape[1]}')
+print(f'  frame_time: {len(frame_time)}')
+
+
+# Assemble output
+out = pd.DataFrame(
+    {
+        'frame': phon['frame'],
+        'time': phon['time'],
+        'vowel_onset': vowel_onset,
+        'vowel_duration': vowel_duration,
+        'phoneme_onset': phoneme_onset,
+        'phoneme_duration': phoneme_duration,
+        'word_onset': word_onset,
+        'word_duration': word_duration,
+        'word_frequency': word_frequency,
+        'word_char_len': word_char_len,
+        'word_ner': word_ner,
+        'pause_duration_ms': pause_duration_ms,
+        'biphone_surprisal': biphone_surprisal,
+        'env': env_aligned,
+        'env_peak_rate': env_peak_rate_aligned,
+        'pitch_hz': pitch_hz_aligned,
+        'pitch_norm': pitch_norm_aligned,
+        'pitch_up': pitch_up_aligned,
+        'pitch_down': pitch_down_aligned,
     }
-    svg_data = displacy.render(doc, style="dep", jupyter=False, options=options)
+)
 
-    # Make relation labels and POS tags more readable in video overlays.
-    word_px = 24 if token_count <= 12 else 22 if token_count <= 20 else 20
-    rel_px = 20 if token_count <= 12 else 18 if token_count <= 20 else 16
-    outline_px = 1.4 if token_count <= 20 else 1.2
-    svg_style = f"""
-    .displacy-word {{
-        font-size: {word_px}px !important;
-        fill: #ffffff !important;
-        paint-order: stroke;
-        stroke: rgba(0, 0, 0, 0.75);
-        stroke-width: {outline_px}px;
-    }}
-    .displacy-tag, .displacy-label {{
-        font-size: {rel_px}px !important;
-        fill: #00e5ff !important;
-        font-weight: 700;
-        paint-order: stroke;
-        stroke: rgba(0, 0, 0, 0.80);
-        stroke-width: {outline_px}px;
-    }}
-    .displacy-arc {{
-        stroke-width: 2.6px !important;
-    }}
-    .displacy-arrowhead {{
-        fill: #00e5ff !important;
-    }}
-    """
-    svg_open_end = svg_data.find(">")
-    if svg_open_end != -1:
-        svg_data = (
-            svg_data[:svg_open_end + 1]
-            + f"<defs><style><![CDATA[{svg_style}]]></style></defs>"
-            + svg_data[svg_open_end + 1:]
-        )
+for k, v in mel_aligned.items():
+    out[k] = v
 
-    png_data = cairosvg.svg2png(
-        bytestring=svg_data.encode("utf-8"),
-        scale=supersample,
-        dpi=384,
-    )
-    img = Image.open(io.BytesIO(png_data)).convert("RGBA")
+out.to_csv(out_csv, index=False)
 
-    # Keep natural size for short trees; shrink only if out of bounds.
-    width_ratio = max_width / float(img.width) if img.width > max_width else 1.0
-    height_ratio = max_height / float(img.height) if img.height > max_height else 1.0
-    fit_ratio = min(width_ratio, height_ratio)
-    if fit_ratio < 1.0:
-        fit_width = max(1, int(img.width * fit_ratio))
-        fit_height = max(1, int(img.height * fit_ratio))
-        img = img.resize((fit_width, fit_height), Image.Resampling.LANCZOS)
-
-    return np.array(img)
-
-def process_video():
-    with open(SRT_PATH, 'r', encoding='utf-8') as f:
-        subs = list(srt.parse(f.read()))
-    freq_counts, total_tokens = build_subtitle_frequency_profile(subs)
-
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (w, h))
-
-    current_sub_idx = 0
-    cached_tree = None
-    cached_lexical_rows = []
-    last_rendered_text = None
-    
-    print("Starting video synthesis with caching...")
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
-
-        frame_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        
-        if current_sub_idx < len(subs):
-            sub = subs[current_sub_idx]
-            
-            if sub.start.total_seconds() <= frame_time <= sub.end.total_seconds():
-                clean_text = sub.content.replace('\n', ' ')
-                
-                # ONLY render if the text has changed
-                if clean_text != last_rendered_text:
-                    doc = nlp(clean_text)
-                    cached_tree = render_dep_tree(
-                        doc,
-                        max_width=int(w * TREE_MAX_WIDTH_RATIO),
-                        max_height=int(h * TREE_MAX_HEIGHT_RATIO),
-                    )
-                    cached_lexical_rows = extract_lexical_features(doc, freq_counts, total_tokens)
-                    last_rendered_text = clean_text
-                
-                # Overlay logic
-                overlay_h, overlay_w = cached_tree.shape[:2]
-                if overlay_w > w:
-                    # Simple failsafe resize
-                    cached_tree = cv2.resize(cached_tree, (w, int(overlay_h * (w / overlay_w))))
-                    overlay_h, overlay_w = cached_tree.shape[:2]
-
-                # Clamp/crop to frame bounds to avoid blend shape mismatches.
-                overlay_x = TREE_LEFT_MARGIN_PX
-                overlay_y = TREE_TOP_OFFSET_PX
-                if overlay_y >= h or overlay_x >= w:
-                    continue
-
-                draw_h = min(overlay_h, h - overlay_y)
-                draw_w = min(overlay_w, w - overlay_x)
-                tree_roi = cached_tree[:draw_h, :draw_w, :]
-                tree_bbox = (overlay_x, overlay_y, overlay_x + draw_w, overlay_y + draw_h)
-
-                # Blend into the top area
-                alpha = tree_roi[:, :, 3] / 255.0
-                for c in range(3):
-                    frame[overlay_y:overlay_y + draw_h, overlay_x:overlay_x + draw_w, c] = (
-                        alpha * tree_roi[:, :, c]
-                        + (1 - alpha) * frame[overlay_y:overlay_y + draw_h, overlay_x:overlay_x + draw_w, c]
-                    )
-                draw_lexical_panel(frame, cached_lexical_rows, tree_bbox=tree_bbox)
-            elif frame_time > sub.end.total_seconds():
-                current_sub_idx += 1
-                cached_tree = None # Clear cache for next segment
-                cached_lexical_rows = []
-
-        out.write(frame)
-        if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) % 500 == 0:
-            print(f"Processed {int(cap.get(cv2.CAP_PROP_POS_FRAMES))} frames...")
-
-    cap.release()
-    out.release()
-    print(f"Success! Output: {OUTPUT_PATH}")
-
-if __name__ == "__main__":
-    process_video()
+print(f'\nSaved: {out_csv}')
+print(f'Rows:              {len(out)}')
+print(f'Vowel onsets:      {(out["vowel_onset"] != "").sum()}')
+print(f'Phoneme onsets:    {(out["phoneme_onset"] != "").sum()}')
+print(f'Word onsets:       {(out["word_onset"] != "").sum()}')
+print(f'Word freq onsets:  {(out["word_frequency"] > 0).sum()}')
+print(f'Word NER onsets:   {(out["word_ner"] != "").sum()}')
+print(f'Biphone rows > 0:  {(out["biphone_surprisal"] > 0).sum()}')
+print(f'Mel bands:         {len(mel_aligned)}')
+print(f'Total columns:     {len(out.columns)}')

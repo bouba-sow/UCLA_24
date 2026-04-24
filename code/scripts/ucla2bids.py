@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import json
 import re
 import tempfile
@@ -268,6 +269,40 @@ def get_movie_alignment_seconds(audio_align_json: Path) -> tuple[float, float]:
     return movie_start_rel, drift_multiplier
 
 
+def normalize_event_token(value: object) -> str:
+    return re.sub(r"[^\w']+", "", str(value).lower())
+
+
+def srt_time_to_seconds(ts: str) -> float:
+    hh, mm, rest = ts.split(":")
+    ss, ms = rest.split(",")
+    return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+
+
+def load_srt_sentence_starts(srt_path: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    text = srt_path.read_text(encoding="utf-8")
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+
+    starts: list[float] = []
+    ends: list[float] = []
+    first_tokens: list[str] = []
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 3 or "-->" not in lines[1]:
+            continue
+        start_txt, end_txt = [x.strip() for x in lines[1].split("-->")]
+        sent_text = " ".join(lines[2:]).strip()
+        first_raw = sent_text.split()[0] if sent_text else ""
+        starts.append(srt_time_to_seconds(start_txt))
+        ends.append(srt_time_to_seconds(end_txt))
+        first_tokens.append(normalize_event_token(first_raw))
+    return np.asarray(starts, dtype=float), np.asarray(ends, dtype=float), first_tokens
+
+
+def slugify_label(value: object) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", str(value).lower())).strip("_")
+
+
 # Frame-aligned audio / phonological regressors (must match enriched feature CSV).
 AUDIO_PHONOLOGICAL_FEATURE_COLUMNS: tuple[str, ...] = (
     "env",
@@ -286,8 +321,13 @@ AUDIO_PHONOLOGICAL_FEATURE_COLUMNS: tuple[str, ...] = (
 def build_events_table(
     feature_csv: Path,
     audio_align_json: Path,
+    phoneme_csv: Path,
+    subtitle_srt: Path,
+    characters_csv: Path,
+    concepts_csv: Path,
 ) -> pd.DataFrame:
     feat = pd.read_csv(feature_csv)
+    phon = pd.read_csv(phoneme_csv)
     movie_start_rel, drift_multiplier = get_movie_alignment_seconds(audio_align_json)
 
     for col in ("vowel_onset", "word_onset", "word_ner"):
@@ -310,20 +350,75 @@ def build_events_table(
 
     # Keep one events row per frame (full frame-wise table).
     ev = feat.copy()
+    if len(phon) != len(ev):
+        raise ValueError(
+            f"Phoneme CSV row count ({len(phon)}) does not match feature CSV row count ({len(ev)})."
+        )
 
     ev["onset"] = movie_start_rel + ev["time"].astype(float) * drift_multiplier
     ev["duration"] = ev[["vowel_duration", "word_duration"]].fillna(0.0).max(axis=1)
+    ev["Event"] = np.where(ev["word_onset"].astype(str).str.strip().ne(""), "word_onset", "no_event")
+    sub_starts, sub_ends, sub_first_tokens = load_srt_sentence_starts(subtitle_srt)
+    word_onset_idx = np.flatnonzero(ev["Event"].eq("word_onset").to_numpy())
+    for idx in word_onset_idx:
+        word_t = float(ev.iloc[idx]["time"])
+        token = normalize_event_token(ev.iloc[idx]["word_onset"])
+        if not token or sub_starts.size == 0:
+            continue
+        sub_i = bisect_right(sub_starts, word_t) - 1
+        if sub_i < 0 or sub_i >= len(sub_first_tokens):
+            continue
+        if not (sub_starts[sub_i] <= word_t <= sub_ends[sub_i]):
+            continue
+        if token == sub_first_tokens[sub_i]:
+            ev.iloc[idx, ev.columns.get_loc("Event")] = "first_word_onset"
 
     ev["word_ner"] = ev["word_ner"].replace("", "n/a")
 
     for col in AUDIO_PHONOLOGICAL_FEATURE_COLUMNS:
         ev[col] = pd.to_numeric(ev[col], errors="coerce").fillna(0.0)
 
+    # Frame-wise character one-hot columns (30 fps labels).
+    char_df = pd.read_csv(characters_csv)
+    if "Frame" not in char_df.columns:
+        raise ValueError(f"Character CSV must include 'Frame' column: {characters_csv}")
+    char_cols = [c for c in char_df.columns if c != "Frame"]
+    char_aligned = (
+        char_df.set_index("Frame")[char_cols]
+        .reindex(ev["frame"].astype(int).to_numpy(), fill_value=0)
+        .reset_index(drop=True)
+    )
+    char_name_map = {c: f"char_{slugify_label(c)}" for c in char_cols}
+    for src, dst in char_name_map.items():
+        ev[dst] = pd.to_numeric(char_aligned[src], errors="coerce").fillna(0.0)
+
+    # Event override: mark only Jack Bauer on-screen onsets (0->1 transitions).
+    j_bauer_col = next((c for c in char_cols if normalize_event_token(c) == "jbauer"), None)
+    if j_bauer_col is not None:
+        jb = pd.to_numeric(char_aligned[j_bauer_col], errors="coerce").fillna(0.0).to_numpy()
+        jb_present = jb > 0
+        jb_onset = jb_present & np.concatenate(([True], ~jb_present[:-1]))
+        ev.loc[jb_onset, "Event"] = "j_bauer"
+
+    # 1 Hz concept labels expanded to frame rows by floor(Time).
+    concept_df = pd.read_csv(concepts_csv)
+    concept_cols = list(concept_df.columns)
+    concept_name_map = {c: f"concept_{slugify_label(c)}" for c in concept_cols}
+    sec_idx = np.floor(ev["time"].astype(float).to_numpy()).astype(int)
+    n_concepts = len(concept_df)
+    valid = (sec_idx >= 0) & (sec_idx < n_concepts)
+    for src, dst in concept_name_map.items():
+        vals = np.zeros(len(ev), dtype=float)
+        arr = pd.to_numeric(concept_df[src], errors="coerce").fillna(0.0).to_numpy()
+        vals[valid] = arr[sec_idx[valid]]
+        ev[dst] = vals
+
     keep_cols = [
         "onset",
         "duration",
+        "Event",
         "frame",
-        "time",
+        "Time",
         "vowel_onset",
         "word_onset",
         "vowel_duration",
@@ -331,7 +426,10 @@ def build_events_table(
         "word_frequency",
         "word_ner",
         *AUDIO_PHONOLOGICAL_FEATURE_COLUMNS,
+        *char_name_map.values(),
+        *concept_name_map.values(),
     ]
+    ev = ev.rename(columns={"time": "Time"})
     ev = ev[keep_cols].sort_values("onset").reset_index(drop=True)
     return ev
 
@@ -339,8 +437,22 @@ def build_events_table(
 EVENT_COLUMN_DESCRIPTIONS: dict[str, dict[str, object]] = {
     "onset": {"Description": "Onset of the event in seconds relative to the start of the iEEG recording."},
     "duration": {"Description": "Event duration in seconds. Uses max(word_duration, vowel_duration) per frame row."},
+    "Event": {
+        "Description": (
+            "Frame-level event label: 'first_word_onset' for sentence-initial words "
+            "(matched against subtitle sentence-initial token), 'word_onset' for other word onsets, "
+            "'j_bauer' for Jack Bauer on-screen onset frames, "
+            "otherwise 'no_event'."
+        ),
+        "Levels": {
+            "first_word_onset": "Frame contains a sentence-initial word onset based on subtitle sentence starts.",
+            "word_onset": "Frame contains a word onset token.",
+            "j_bauer": "Frame is an onset where Jack Bauer appears on screen (0->1 transition).",
+            "no_event": "Frame does not contain a word onset token.",
+        },
+    },
     "frame": {"Description": "Frame index in the movie-derived linguistic feature table."},
-    "time": {"Description": "Time in seconds from movie start in the feature table."},
+    "Time": {"Description": "Time in seconds from movie start in the feature table."},
     "vowel_onset": {"Description": "IPA vowel token at onset row, else empty."},
     "word_onset": {"Description": "Word token at onset row, else empty."},
     "vowel_duration": {"Description": "Duration in seconds of vowel segment, written only at onset rows."},
@@ -403,6 +515,10 @@ def main() -> None:
     parser.add_argument("--localization-xlsx", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/ucla_data/572/sub-572_localizations.xlsx"))
     parser.add_argument("--bids-root", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/bids"))
     parser.add_argument("--feature-events-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_events_vowel_word_features.csv"))
+    parser.add_argument("--phoneme-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_phonemes.csv"))
+    parser.add_argument("--subtitle-srt", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01.srt"))
+    parser.add_argument("--characters-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/40m_act_24_S06E01_30fps_characters.csv"))
+    parser.add_argument("--concepts-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_8concepts_merged.csv"))
     parser.add_argument("--audio-align-json", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/ucla_data/572/Experiment-9/Audio/572_exp_09_preSleep_movie_24_audio_movie_start_time.json"))
     parser.add_argument("--subject", type=str, default="572")
     parser.add_argument("--session", type=str, default="01")
@@ -429,7 +545,14 @@ def main() -> None:
             )
 
     write_ieeg_metadata(args.bids_root, args.subject, args.session, electrodes_df)
-    events_df = build_events_table(args.feature_events_csv, args.audio_align_json)
+    events_df = build_events_table(
+        args.feature_events_csv,
+        args.audio_align_json,
+        args.phoneme_csv,
+        args.subtitle_srt,
+        args.characters_csv,
+        args.concepts_csv,
+    )
     write_events_files(
         args.bids_root,
         args.subject,
