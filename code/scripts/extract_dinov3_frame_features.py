@@ -28,8 +28,8 @@ def build_transform(image_size: int) -> transforms.Compose:
     )
 
 
-def load_model(repo: str, model_name: str, device: torch.device) -> torch.nn.Module:
-    model = torch.hub.load(repo, model_name)
+def load_model(repo: str, model_name: str, source: str, weights: str, device: torch.device) -> torch.nn.Module:
+    model = torch.hub.load(repo, model_name, source=source, weights=weights)
     model.eval()
     model.to(device)
     return model
@@ -88,32 +88,32 @@ def main() -> None:
     parser.add_argument(
         "--video-path",
         type=Path,
-        default=Path("/store/scratch/bsow/Documents/UCLA_24/data/40m_act_24_S06E01_30fps.m4v"),
+        default=Path("data/40m_act_24_S06E01_30fps.m4v"),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/store/scratch/bsow/Documents/UCLA_24/data/features/dinov3_vithplus_distilled/s06e01/frame_npy"),
+        default=Path("data/features/dinov3_vithplus_distilled/s06e01/frame_npy"),
     )
     parser.add_argument(
         "--manifest-csv",
         type=Path,
-        default=Path("/store/scratch/bsow/Documents/UCLA_24/data/features/dinov3_vithplus_distilled/s06e01/frame_npy_paths.csv"),
+        default=Path("data/features/dinov3_vithplus_distilled/s06e01/frame_npy_paths.csv"),
     )
     parser.add_argument(
         "--manifest-txt",
         type=Path,
-        default=Path("/store/scratch/bsow/Documents/UCLA_24/data/features/dinov3_vithplus_distilled/s06e01/frame_npy_paths.txt"),
+        default=Path("data/features/dinov3_vithplus_distilled/s06e01/frame_npy_paths.txt"),
     )
     parser.add_argument(
         "--metadata-json",
         type=Path,
-        default=Path("/store/scratch/bsow/Documents/UCLA_24/data/features/dinov3_vithplus_distilled/s06e01/extraction_metadata.json"),
+        default=Path("data/features/dinov3_vithplus_distilled/s06e01/extraction_metadata.json"),
     )
-    parser.add_argument("--model-repo", type=str, default="facebookresearch/dinov3")
-    parser.add_argument("--model-name", type=str, default="dinov3_vith14plus_distilled_lvd1689m")
+    parser.add_argument("--model-repo", type=str, default="/home/boubacar/Téléchargements/dinov3")
+    parser.add_argument("--model-name", type=str, default="dinov3_vith16plus")
     parser.add_argument("--image-size", type=int, default=518)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=30)
     parser.add_argument("--true-fps", type=float, default=TRUE_FPS_FROM_README)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -128,7 +128,9 @@ def main() -> None:
 
     device = torch.device(args.device)
     transform = build_transform(args.image_size)
-    model = load_model(args.model_repo, args.model_name, device)
+    source = "local"
+    weights= "/home/boubacar/Téléchargements/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth"
+    model = load_model(args.model_repo, args.model_name, source, weights, device)
 
     cap = cv2.VideoCapture(str(args.video_path))
     if not cap.isOpened():
