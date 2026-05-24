@@ -77,6 +77,8 @@ def write_metadata(
         "model_name": args.model_name,
         "image_size": int(args.image_size),
         "batch_size": int(args.batch_size),
+        "layer_index": int(args.layer_index),
+        "total_layers": int(args.total_layers),
         "feature_dim": int(output_dim),
         "device": args.device,
     }
@@ -110,10 +112,16 @@ def main() -> None:
         type=Path,
         default=Path("data/features/dinov3_vithplus_distilled/s06e01/extraction_metadata.json"),
     )
-    parser.add_argument("--model-repo", type=str, default="/home/boubacar/Téléchargements/dinov3")
+    parser.add_argument("--model-repo", type=str, default="dinov3")
     parser.add_argument("--model-name", type=str, default="dinov3_vith16plus")
     parser.add_argument("--image-size", type=int, default=518)
-    parser.add_argument("--batch-size", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=120)
+    parser.add_argument(
+        "--layer-index",
+        type=int,
+        default=None,
+        help="Transformer block index to extract (0-based). Defaults to middle layer.",
+    )
     parser.add_argument("--true-fps", type=float, default=TRUE_FPS_FROM_README)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -129,8 +137,17 @@ def main() -> None:
     device = torch.device(args.device)
     transform = build_transform(args.image_size)
     source = "local"
-    weights= "/home/boubacar/Téléchargements/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth"
+    weights= "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth"
     model = load_model(args.model_repo, args.model_name, source, weights, device)
+    if not hasattr(model, "get_intermediate_layers") or not hasattr(model, "blocks"):
+        raise RuntimeError("Loaded model does not support intermediate layer extraction.")
+    total_layers = len(model.blocks)
+    args.total_layers = total_layers
+    if args.layer_index is None:
+        args.layer_index = total_layers // 2
+    if args.layer_index < 0 or args.layer_index >= total_layers:
+        raise ValueError(f"--layer-index must be in [0, {total_layers - 1}], got {args.layer_index}")
+    print(f"Using intermediate layer {args.layer_index} of {total_layers} total layers.")
 
     cap = cv2.VideoCapture(str(args.video_path))
     if not cap.isOpened():
@@ -153,8 +170,16 @@ def main() -> None:
             return
         with torch.inference_mode():
             inputs = torch.stack(batch_tensors, dim=0).to(device, non_blocking=True)
-            outputs = model(inputs)
-            embeddings = resolve_embedding(outputs).detach().cpu().numpy().astype(np.float32)
+            layer_outputs = model.get_intermediate_layers(
+                inputs,
+                n=[args.layer_index],
+                return_class_token=True,
+                norm=True,
+            )
+            if not layer_outputs:
+                raise RuntimeError("Model returned no intermediate layer outputs.")
+            _, cls_token = layer_outputs[0]
+            embeddings = cls_token.detach().cpu().numpy().astype(np.float32)
         output_dim = int(embeddings.shape[1])
 
         for local_i, idx in enumerate(batch_frame_indices):

@@ -1,28 +1,33 @@
 [project]
 name = "ucla-24"
 version = "0.1.0"
-description = "Add your description here"
+description = "iEEG / spike analysis and feature extraction for the 24 S06E01 dataset (UCLA)"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "cairosvg>=2.9.0",
     "h5py>=3.16.0",
+    "imageio[ffmpeg]>=2.37.3",
     "librosa>=0.11.0",
     "mne>=1.12.1",
     "mne-bids>=0.18.0",
+    "nilearn>=0.13.1",
     "openai-whisper>=20250625",
     "opencv-python>=4.13.0.92",
     "openpyxl>=3.1.5",
     "pandas>=3.0.1",
+    "plotly>=6.7.0",
     "praatio>=6.2.2",
     "pybv>=0.7.6",
     "pycairo>=1.29.0",
     "pydub>=0.25.1",
     "pysrt>=1.1.2",
+    "pyvista>=0.48.0",
     "setuptools>=82.0.1",
     "soundfile>=0.13.1",
     "spacy-stanza>=1.0.4",
     "srt>=3.5.3",
+    "termcolor>=3.3.0",
     "torch>=2.8.0",
     "torchcrepe>=0.0.24",
     "torchvision>=0.23.0",

@@ -6,32 +6,42 @@ dist/
 wheels/
 *.egg-info
 
-# mfa data
-data/mfa_data/
-data/mfa_output/
-
-# slurm logs
-*.out
-
-# trash
-trash/
-
 # Virtual environments
 .venv
 
-# NeMo
-NeMo/
+# MFA intermediate data
+data/mfa_data/
+data/mfa_output/
 
-# videos and audios
+# Raw / processed data (large, not version-controlled)
+data/ucla_data/
+data/bids/
+data/bids2/
+data/features/
+*.npy
+
+# Model weights
+*.pth
+
+# Videos, audio, and other large media
 *.mp4
 *.avi
 *.m4v
 *.wav
 
-# output
-output/
+# PDFs
+*.pdf
 
-# data
-data/ucla_data/
-data/bids/
-data/bids2/
+# Output directories
+output/
+outputs/
+results/
+
+# DINOv3 model library (submodule / external clone)
+dinov3/
+
+# Slurm logs
+*.out
+
+# Trash
+trash/
