@@ -5,7 +5,6 @@ description = "iEEG / spike analysis and feature extraction for the 24 S06E01 da
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "cairosvg>=2.9.0",
     "h5py>=3.16.0",
     "imageio[ffmpeg]>=2.37.3",
     "librosa>=0.11.0",
@@ -19,7 +18,6 @@ dependencies = [
     "plotly>=6.7.0",
     "praatio>=6.2.2",
     "pybv>=0.7.6",
-    "pycairo>=1.29.0",
     "pydub>=0.25.1",
     "pysrt>=1.1.2",
     "pyvista>=0.48.0",

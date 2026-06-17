@@ -775,30 +775,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-align-file", action="store_true")
     p.add_argument("--movie-t0-sec", type=float, default=None)
     p.add_argument("--drift", type=float, default=None)
-    p.add_argument("--film-time-start", type=float, default=0.0)
-    p.add_argument("--duration-sec", type=float, default=30.0)
+    p.add_argument("--film-time-start", type=float, default=70.0)
+    p.add_argument("--duration-sec", type=float, default=140.0)
     p.add_argument(
         "--embed-video-path",
         type=Path,
-        default=None,
+        default=Path("/store/scratch/bsow/Documents/UCLA_24/data/40m_act_24_S06E01_30fps.m4v"),
         help="Optional movie file to embed as a top 'TV' panel.",
     )
     p.add_argument(
         "--embed-top-frac",
         type=float,
-        default=0.28,
+        default=0.45,
         help="Fraction of output height reserved for embedded top video (0-0.8).",
     )
     p.add_argument(
         "--embed-gap-px",
         type=int,
-        default=8,
+        default=0,
         help="Vertical gap in pixels between top embedded video and brains.",
     )
     p.add_argument(
         "--embed-width-frac",
         type=float,
-        default=1.0,
+        default=0.4,
         help="Width fraction of top embedded movie panel (0.1-1.0).",
     )
     p.add_argument(
@@ -818,7 +818,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--brain-panel-y-shift-px",
         type=int,
-        default=0,
+        default=14,
         help="Vertical shift (px) for brain panel placement when embedding movie; positive moves down.",
     )
     p.add_argument(
@@ -835,13 +835,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--brain-views", type=int, default=3, help="1 or 3.")
     p.add_argument("--electrode-size", type=float, default=12.0, help="Point size in pixels.")
-    p.add_argument("--brain-alpha", type=float, default=0.40)
+    p.add_argument("--brain-alpha", type=float, default=0.6)
     p.add_argument("--surface-decim", type=int, default=1, help="1 keeps highest mesh detail.")
-    p.add_argument("--sulc-contrast", type=float, default=0.8, help="Lower values increase fold contrast.")
+    p.add_argument("--sulc-contrast", type=float, default=1.0, help="Lower values increase fold contrast.")
     p.add_argument(
         "--activity-metric",
         type=str,
-        default="rms",
+        default="high_gamma",
         choices=["rms", "mean_abs", "high_gamma"],
         help="Electrode activity metric per frame.",
     )
@@ -855,7 +855,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--threshold-mode",
         type=str,
-        default="none",
+        default="quantile",
         choices=["none", "fixed", "quantile"],
         help="Thresholding mode for electrode display.",
     )
@@ -863,7 +863,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--threshold-quantile",
         type=float,
-        default=0.90,
+        default=0.95,
         help="Quantile of |z| when mode=quantile (e.g. 0.90).",
     )
     p.add_argument(
@@ -882,8 +882,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--parallel-scale-factor",
         type=float,
-        default=1.8,
-        help="Parallel projection zoom control; larger values zoom out more (default 1.8).",
+        default=1.0,
+        help="Parallel projection zoom control; larger values zoom out more.",
     )
     p.add_argument(
         "--brain-cmap",
@@ -897,25 +897,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--brain-clim-low",
         type=float,
-        default=0.0,
+        default=0.05,
         help="Lower sulcal intensity bound (0-1).",
     )
     p.add_argument(
         "--brain-clim-high",
         type=float,
-        default=1.0,
+        default=0.95,
         help="Upper sulcal intensity bound (0-1).",
     )
     p.add_argument(
         "--neutral-color",
         type=str,
-        default="#7a7a7a",
+        default="#8a8a8a",
         help="Neutral color for near-zero and dimmed-below-threshold electrodes.",
     )
     p.add_argument(
         "--brain-solid-color",
         type=str,
-        default=None,
+        default="#6f6f6f",
         help="If set (e.g. '#6f6f6f'), use uniform cortex color and disable sulcal colormap shading.",
     )
     p.add_argument(
@@ -926,7 +926,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--spin-deg-per-sec",
         type=float,
-        default=0.0,
+        default=3.0,
         help="Optional camera spin speed in degrees/sec (0 = fixed views).",
     )
     p.add_argument(
@@ -944,13 +944,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--view-azim-offsets",
         type=str,
-        default="0,0,15",
+        default="0,270,270",
         help="Per-view azimuth offsets in degrees (comma-separated). 1 value applies to all views.",
     )
     p.add_argument(
         "--view-elev-offsets",
         type=str,
-        default="0",
+        default="0,180,0",
         help="Per-view elevation offsets in degrees (comma-separated). 1 value applies to all views.",
     )
     p.add_argument("--no-text", action="store_true", help="Disable title text overlay.")

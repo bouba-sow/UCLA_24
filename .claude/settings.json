@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(k,':',d[k] if not isinstance\\(d[k],dict\\) else d[k].get\\('Description',''\\)\\) for k in d]\")"
+    ]
+  }
+}

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right
 import json
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -150,10 +150,11 @@ def load_localization_sheet(localization_xlsx: Path) -> pd.DataFrame:
 
 
 def micro_lookup_key(channel: str) -> str:
-    # GA1-RA1 -> RA1 (localization uses shaft/contact naming)
+    # GA1-RA3 -> RA_micro1: all microwires on a shaft share the tip position
     if "-" in channel:
         channel = channel.split("-", 1)[1]
-    return normalize_name(channel)
+    shaft = channel.rstrip("0123456789")
+    return normalize_name(f"{shaft}_micro1")
 
 
 def macro_lookup_key(channel: str) -> str:
@@ -269,39 +270,25 @@ def get_movie_alignment_seconds(audio_align_json: Path) -> tuple[float, float]:
     return movie_start_rel, drift_multiplier
 
 
-def normalize_event_token(value: object) -> str:
-    return re.sub(r"[^\w']+", "", str(value).lower())
-
-
-def srt_time_to_seconds(ts: str) -> float:
-    hh, mm, rest = ts.split(":")
-    ss, ms = rest.split(",")
-    return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
-
-
-def load_srt_sentence_starts(srt_path: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    text = srt_path.read_text(encoding="utf-8")
-    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
-
-    starts: list[float] = []
-    ends: list[float] = []
-    first_tokens: list[str] = []
-    for block in blocks:
-        lines = block.splitlines()
-        if len(lines) < 3 or "-->" not in lines[1]:
-            continue
-        start_txt, end_txt = [x.strip() for x in lines[1].split("-->")]
-        sent_text = " ".join(lines[2:]).strip()
-        first_raw = sent_text.split()[0] if sent_text else ""
-        starts.append(srt_time_to_seconds(start_txt))
-        ends.append(srt_time_to_seconds(end_txt))
-        first_tokens.append(normalize_event_token(first_raw))
-    return np.asarray(starts, dtype=float), np.asarray(ends, dtype=float), first_tokens
-
-
 def slugify_label(value: object) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", str(value).lower())).strip("_")
 
+
+VIDEO_NOMINAL_FPS = 29.97
+CONCEPT_ANNOTATION_HZ = 1.0
+CONCEPT_TRAINING_BIN_HZ = 4.0
+
+# Paper eight-concept schema (movie on-screen annotations only; source CSV column names).
+PAPER_CONCEPT_SOURCE_MAP: dict[str, list[str]] = {
+    "white_house": ["WhiteHouse"],
+    "cia": ["CTU"],
+    "sacrifice": ["Hostage"],
+    "handcuff": ["Handcuff"],
+    "j_bauer": ["J.Bauer"],
+    "b_buchanan": ["B.Buchanan"],
+    "a_fayed": ["A.Fayed"],
+    "a_amar": ["A.Amar"],
+}
 
 # Frame-aligned audio / phonological regressors (must match enriched feature CSV).
 AUDIO_PHONOLOGICAL_FEATURE_COLUMNS: tuple[str, ...] = (
@@ -313,24 +300,53 @@ AUDIO_PHONOLOGICAL_FEATURE_COLUMNS: tuple[str, ...] = (
     "pitch_down",
     "pause_duration_ms",
     "word_char_len",
-    "biphone_surprisal",
     *(f"mel_{i:02d}" for i in range(16)),
 )
+
+
+def frame_duration_seconds(stimulus_times: np.ndarray) -> float:
+    diffs = np.diff(np.asarray(stimulus_times, dtype=float))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return 1.0 / VIDEO_NOMINAL_FPS
+    return float(np.median(diffs))
+
+
+def align_paper_concepts(concept_df: pd.DataFrame, stimulus_times: np.ndarray) -> dict[str, np.ndarray]:
+    """Expand 1 Hz on-screen concept CSV to frame rows using the paper concept schema."""
+    sec_idx = np.floor(stimulus_times).astype(int)
+    n_sec = len(concept_df)
+    valid = (sec_idx >= 0) & (sec_idx < n_sec)
+    out: dict[str, np.ndarray] = {}
+    for paper_name, source_cols in PAPER_CONCEPT_SOURCE_MAP.items():
+        merged_sec = np.zeros(n_sec, dtype=float)
+        for col in source_cols:
+            if col not in concept_df.columns:
+                raise ValueError(
+                    f"Concept CSV missing column {col!r} required for concept_{paper_name}"
+                )
+            merged_sec = np.maximum(
+                merged_sec,
+                pd.to_numeric(concept_df[col], errors="coerce").fillna(0.0).to_numpy(),
+            )
+        vals = np.zeros(len(stimulus_times), dtype=float)
+        vals[valid] = merged_sec[sec_idx[valid]]
+        out[f"concept_{paper_name}"] = vals
+    return out
 
 
 def build_events_table(
     feature_csv: Path,
     audio_align_json: Path,
     phoneme_csv: Path,
-    subtitle_srt: Path,
     characters_csv: Path,
     concepts_csv: Path,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict[str, object]]:
     feat = pd.read_csv(feature_csv)
     phon = pd.read_csv(phoneme_csv)
     movie_start_rel, drift_multiplier = get_movie_alignment_seconds(audio_align_json)
 
-    for col in ("vowel_onset", "word_onset", "word_ner"):
+    for col in ("vowel_onset", "word_onset"):
         if col not in feat.columns:
             raise ValueError(f"Missing required column in features CSV: {col}")
         feat[col] = feat[col].fillna("")
@@ -355,25 +371,11 @@ def build_events_table(
             f"Phoneme CSV row count ({len(phon)}) does not match feature CSV row count ({len(ev)})."
         )
 
-    ev["onset"] = movie_start_rel + ev["time"].astype(float) * drift_multiplier
-    ev["duration"] = ev[["vowel_duration", "word_duration"]].fillna(0.0).max(axis=1)
-    ev["Event"] = np.where(ev["word_onset"].astype(str).str.strip().ne(""), "word_onset", "no_event")
-    sub_starts, sub_ends, sub_first_tokens = load_srt_sentence_starts(subtitle_srt)
-    word_onset_idx = np.flatnonzero(ev["Event"].eq("word_onset").to_numpy())
-    for idx in word_onset_idx:
-        word_t = float(ev.iloc[idx]["time"])
-        token = normalize_event_token(ev.iloc[idx]["word_onset"])
-        if not token or sub_starts.size == 0:
-            continue
-        sub_i = bisect_right(sub_starts, word_t) - 1
-        if sub_i < 0 or sub_i >= len(sub_first_tokens):
-            continue
-        if not (sub_starts[sub_i] <= word_t <= sub_ends[sub_i]):
-            continue
-        if token == sub_first_tokens[sub_i]:
-            ev.iloc[idx, ev.columns.get_loc("Event")] = "first_word_onset"
-
-    ev["word_ner"] = ev["word_ner"].replace("", "n/a")
+    stimulus_times = ev["time"].astype(float).to_numpy()
+    frame_dt = frame_duration_seconds(stimulus_times)
+    ev["stimulus_time"] = stimulus_times
+    ev["onset"] = movie_start_rel + stimulus_times * drift_multiplier
+    ev["duration"] = frame_dt
 
     for col in AUDIO_PHONOLOGICAL_FEATURE_COLUMNS:
         ev[col] = pd.to_numeric(ev[col], errors="coerce").fillna(0.0)
@@ -392,77 +394,86 @@ def build_events_table(
     for src, dst in char_name_map.items():
         ev[dst] = pd.to_numeric(char_aligned[src], errors="coerce").fillna(0.0)
 
-    # Event override: mark only Jack Bauer on-screen onsets (0->1 transitions).
-    j_bauer_col = next((c for c in char_cols if normalize_event_token(c) == "jbauer"), None)
-    if j_bauer_col is not None:
-        jb = pd.to_numeric(char_aligned[j_bauer_col], errors="coerce").fillna(0.0).to_numpy()
-        jb_present = jb > 0
-        jb_onset = jb_present & np.concatenate(([True], ~jb_present[:-1]))
-        ev.loc[jb_onset, "Event"] = "j_bauer"
-
-    # 1 Hz concept labels expanded to frame rows by floor(Time).
     concept_df = pd.read_csv(concepts_csv)
-    concept_cols = list(concept_df.columns)
-    concept_name_map = {c: f"concept_{slugify_label(c)}" for c in concept_cols}
-    sec_idx = np.floor(ev["time"].astype(float).to_numpy()).astype(int)
-    n_concepts = len(concept_df)
-    valid = (sec_idx >= 0) & (sec_idx < n_concepts)
-    for src, dst in concept_name_map.items():
-        vals = np.zeros(len(ev), dtype=float)
-        arr = pd.to_numeric(concept_df[src], errors="coerce").fillna(0.0).to_numpy()
-        vals[valid] = arr[sec_idx[valid]]
+    concept_cols = align_paper_concepts(concept_df, stimulus_times)
+    for dst, vals in concept_cols.items():
         ev[dst] = vals
 
     keep_cols = [
         "onset",
         "duration",
-        "Event",
+        "stimulus_time",
         "frame",
-        "Time",
         "vowel_onset",
         "word_onset",
         "vowel_duration",
         "word_duration",
         "word_frequency",
-        "word_ner",
         *AUDIO_PHONOLOGICAL_FEATURE_COLUMNS,
         *char_name_map.values(),
-        *concept_name_map.values(),
+        *concept_cols.keys(),
     ]
-    ev = ev.rename(columns={"time": "Time"})
     ev = ev[keep_cols].sort_values("onset").reset_index(drop=True)
-    return ev
+
+    timing_meta = {
+        "StimulusTiming": {
+            "Description": "Alignment between movie stimulus clock and iEEG recording clock.",
+            "Formula": "onset = start_rel_rec + stimulus_time * drift_correction_multiplier",
+            "start_rel_rec": movie_start_rel,
+            "drift_correction_multiplier": drift_multiplier,
+            "stimulus_time_reference": (
+                "Seconds from audio-aligned movie start (pre-drift video clock; matches feature CSV time)."
+            ),
+            "video_nominal_fps": VIDEO_NOMINAL_FPS,
+            "frame_duration_sec": frame_dt,
+        },
+        "ConceptLabels": {
+            "Description": (
+                "Eight paper decoder-target concepts from on-screen movie annotations only "
+                "(no free-recall linguistic mentions)."
+            ),
+            "Source": "movie_viewing_on_screen",
+            "AnnotationRateHz": CONCEPT_ANNOTATION_HZ,
+            "TrainingBinHz": CONCEPT_TRAINING_BIN_HZ,
+            "FrameAssignment": (
+                "Each 1 s annotation applies to all frames with floor(stimulus_time) equal to that "
+                "second index (equivalent to four identical 250 ms training bins per second)."
+            ),
+            "SourceColumnMerges": {
+                "concept_cia": "CTU",
+                "concept_sacrifice": "Hostage",
+            },
+        },
+    }
+    return ev, timing_meta
 
 
 EVENT_COLUMN_DESCRIPTIONS: dict[str, dict[str, object]] = {
-    "onset": {"Description": "Onset of the event in seconds relative to the start of the iEEG recording."},
-    "duration": {"Description": "Event duration in seconds. Uses max(word_duration, vowel_duration) per frame row."},
-    "Event": {
+    "onset": {
         "Description": (
-            "Frame-level event label: 'first_word_onset' for sentence-initial words "
-            "(matched against subtitle sentence-initial token), 'word_onset' for other word onsets, "
-            "'j_bauer' for Jack Bauer on-screen onset frames, "
-            "otherwise 'no_event'."
+            "Frame onset in seconds relative to the start of the iEEG recording "
+            "(drift-corrected movie clock)."
         ),
-        "Levels": {
-            "first_word_onset": "Frame contains a sentence-initial word onset based on subtitle sentence starts.",
-            "word_onset": "Frame contains a word onset token.",
-            "j_bauer": "Frame is an onset where Jack Bauer appears on screen (0->1 transition).",
-            "no_event": "Frame does not contain a word onset token.",
-        },
+    },
+    "duration": {
+        "Description": "Frame duration in seconds (median inter-frame stimulus_time step).",
+    },
+    "stimulus_time": {
+        "Description": (
+            "Time in seconds from audio-aligned movie start in the pre-drift stimulus clock "
+            "(feature CSV time axis)."
+        ),
     },
     "frame": {"Description": "Frame index in the movie-derived linguistic feature table."},
-    "Time": {"Description": "Time in seconds from movie start in the feature table."},
     "vowel_onset": {"Description": "IPA vowel token at onset row, else empty."},
     "word_onset": {"Description": "Word token at onset row, else empty."},
     "vowel_duration": {"Description": "Duration in seconds of vowel segment, written only at onset rows."},
     "word_duration": {"Description": "Duration in seconds of word segment, written only at onset rows."},
     "word_frequency": {"Description": "Zipf frequency from wordfreq package (language='en') at word onset rows."},
-    "word_ner": {"Description": "Named entity label at word onset rows derived from subtitle-context NER; n/a if none."},
     "env": {"Description": "Short-time loudness / envelope feature aligned to the movie audio track (frame-wise)."},
     "env_peak_rate": {"Description": "Rate of envelope peaks in the analysis window (frame-wise)."},
     "pitch_hz": {"Description": "F0 estimate in Hz from the movie audio (frame-wise)."},
-    "pitch_norm": {"Description": "Speaker-normalized pitch (e.g. z-scored F0) in arbitrary units (frame-wise)."},
+    "pitch_norm": {"Description": "Speaker-normalized pitch (min-max on voiced frames) in arbitrary units (frame-wise)."},
     "pitch_up": {"Description": "Magnitude of upward pitch movement in the frame (frame-wise)."},
     "pitch_down": {"Description": "Magnitude of downward pitch movement in the frame (frame-wise)."},
     "pause_duration_ms": {
@@ -470,12 +481,20 @@ EVENT_COLUMN_DESCRIPTIONS: dict[str, dict[str, object]] = {
         "Units": "ms",
     },
     "word_char_len": {"Description": "Character length of the word token at word-onset rows; 0 otherwise."},
-    "biphone_surprisal": {"Description": "Phoneme biphone surprisal (negative log probability) at relevant frames; 0 if n/a."},
     **{
         f"mel_{i:02d}": {
             "Description": f"Log-mel spectrum bin {i} (normalized), frame-aligned to movie audio.",
         }
         for i in range(16)
+    },
+    **{
+        f"concept_{name}": {
+            "Description": (
+                f"Paper concept '{name.replace('_', ' ')}' presence (1/0) from on-screen movie "
+                f"annotations at {CONCEPT_ANNOTATION_HZ:g} Hz."
+            ),
+        }
+        for name in PAPER_CONCEPT_SOURCE_MAP
     },
 }
 
@@ -488,6 +507,7 @@ def write_events_files(
     acqs: list[str],
     run: str,
     events_df: pd.DataFrame,
+    timing_meta: dict[str, object] | None = None,
 ) -> None:
     ieeg_dir = bids_root / f"sub-{subject}" / f"ses-{session}" / "ieeg"
     ieeg_dir.mkdir(parents=True, exist_ok=True)
@@ -499,7 +519,9 @@ def write_events_files(
 
         events_df.to_csv(tsv_path, sep="\t", index=False, na_rep="n/a")
 
-        metadata = {}
+        metadata: dict[str, object] = {}
+        if timing_meta:
+            metadata.update(timing_meta)
         for col in events_df.columns:
             metadata[col] = EVENT_COLUMN_DESCRIPTIONS.get(
                 col,
@@ -555,7 +577,7 @@ def load_spikes_pipeline_mat(
 def match_detection_indices(
     series_times: np.ndarray,
     detection_times: np.ndarray,
-    atol: float = 1e-5,
+    atol: float = 1e-4,
 ) -> np.ndarray:
     """Map each series spike time to an index in detection_times (pipeline spikes.mat)."""
     order = np.argsort(detection_times)
@@ -687,14 +709,12 @@ def read_bids_recording_duration(
     )
 
 
-def _movie_duration_in_recording(
-    feature_events_csv: Path,
-    drift_multiplier: float,
-) -> float:
+def _movie_duration_video(feature_events_csv: Path) -> float:
+    """Return movie duration in stimulus_time seconds (max time from feature CSV)."""
     feat = pd.read_csv(feature_events_csv, usecols=["time"])
     if feat.empty:
         raise ValueError(f"No rows in feature events CSV: {feature_events_csv}")
-    return float(feat["time"].max()) * drift_multiplier
+    return float(feat["time"].max())
 
 
 def get_movie_start_series(audio_align_json: Path, timestamps_start: float) -> float:
@@ -751,6 +771,7 @@ def build_spike_events_for_channel(
     single_units_only: bool = True,
     time_window: str = "recording",
     movie_duration: float | None = None,
+    drift_multiplier: float = 1.0,
 ) -> tuple[pd.DataFrame, np.ndarray | None, dict[str, object]]:
     """Build spike table and optional (n_spikes, n_samples) waveform matrix from pipeline mat."""
     cluster_id, spike_times_series, unit_class, ts_start = load_times_mat(mat_path)
@@ -818,7 +839,9 @@ def build_spike_events_for_channel(
         micro_mat = find_continuous_micro_mat(experiment_dir, channel)
         aux_meta["continuous_micro_mat"] = str(micro_mat.resolve()) if micro_mat else None
 
-    t_movie_masked = series_onset - movie_start_series
+    # Divide by drift_multiplier to convert from neural clock to video frame time,
+    # consistent with the 'stimulus_time' column in companion events.tsv.
+    t_movie_masked = (series_onset - movie_start_series) / drift_multiplier
     rows = pd.DataFrame(
         {
             "onset": t_ieeg_masked,
@@ -850,8 +873,8 @@ SPIKE_COLUMN_DESCRIPTIONS: dict[str, dict[str, object]] = {
     },
     "movie_onset": {
         "Description": (
-            "Spike time in seconds from audio-aligned movie start (0 = first movie frame). "
-            "Use with companion *_spikedata.npz for full-movie visualization."
+            "Spike time in seconds from audio-aligned movie start in video frame time "
+            "(equivalent to frame_number / video_fps; matches the 'stimulus_time' column in companion events.tsv)."
         ),
         "Units": "s",
     },
@@ -888,6 +911,205 @@ SPIKE_COLUMN_DESCRIPTIONS: dict[str, dict[str, object]] = {
         ),
     },
 }
+
+SPIKE_DATA_NPZ_SCHEMA: dict[str, dict[str, object]] = {
+    "channel": {"Description": "Microwire channel name (e.g. GA1-RA1)."},
+    "times_source": {"Description": "Source of sorted times: 'pipeline' or 'manual'."},
+    "spike_times_movie": {"Description": "Spike time (s) from audio-aligned movie start.", "Units": "s"},
+    "spike_times_recording": {"Description": "Spike time (s) from start of BIDS iEEG recording.", "Units": "s"},
+    "spike_times_series": {"Description": "Spike time (s) in series reference (timestampsStart = 0).", "Units": "s"},
+    "cluster_id": {"Description": "Sorting cluster ID (0=noise, 1+=isolated neuron)."},
+    "detection_index": {"Description": "Index into pipeline {channel}_spikes.mat (spikes[:, index])."},
+    "micro_sample_index": {"Description": "Sample index into Exp-9 CSC_micro continuous file at spike peak."},
+    "waveforms": {"Description": "float32 array (n_spikes, n_waveform_samples). Row i matches events row i."},
+    "firing_rate_counts": {"Description": "Spike count per bin over the movie; bin width = 1/firing_rate_hz. Includes all clusters (cluster 0+). For single-unit analyses recompute from spike_times_movie[cluster_id >= 1]."},
+    "firing_rate_bin_edges": {"Description": "Bin edges in movie seconds (length = len(counts)+1).", "Units": "s"},
+    "firing_rate_hz": {"Description": "Firing-rate binning frequency (e.g. 30 for video FPS).", "Units": "Hz"},
+    "micro_movie_volts": {"Description": "Continuous micro voltage for the movie segment, downsampled.", "Units": "V"},
+    "micro_movie_times": {"Description": "Time axis for micro_movie_volts (s from movie start).", "Units": "s"},
+    "micro_movie_downsample_hz": {"Description": "Sample rate of micro_movie_volts.", "Units": "Hz"},
+    "sampling_frequency_hz": {"Description": "Native micro sampling rate used for waveforms / sample indices.", "Units": "Hz"},
+    "movie_start_rel": {"Description": "Movie start relative to iEEG recording onset.", "Units": "s"},
+    "movie_start_series": {"Description": "Movie start in series time.", "Units": "s"},
+    "movie_duration_sec": {"Description": "Exported movie duration.", "Units": "s"},
+    "drift_correction_multiplier": {"Description": "Multiply movie_onset by this to align with recording clock."},
+    "timestampsStart": {"Description": "Unix time of series reference.", "Units": "s"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Alignment helpers (post-hoc rename of legacy *_spikes.tsv → *_events.tsv)
+# ---------------------------------------------------------------------------
+
+def _parse_desc_from_name(name: str) -> str | None:
+    for pattern in (
+        r"_desc-([^_]+(?:_[^_]+)*?)_(?:spikes|events)(?:\.|$)",
+        r"_desc-([^_]+)_spikedata\.npz$",
+        r"_desc-([^_]+)_spikewaveforms\.npy$",
+    ):
+        m = re.search(pattern, name)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _spikes_tsv_to_events_tsv(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "cluster_id" not in out.columns:
+        raise ValueError("Expected column 'cluster_id' in spikes TSV")
+    out["trial_type"] = "spike"
+    out["value"] = out["cluster_id"].astype(int)
+    lead = ["onset", "duration", "trial_type", "value"]
+    return out[lead + [c for c in out.columns if c not in lead]]
+
+
+def _build_events_json(old_json: dict | None, new_prefix: str, desc: str) -> dict:
+    meta: dict[str, object] = {}
+    if old_json:
+        meta.update(old_json)
+    meta.update(SPIKE_COLUMN_DESCRIPTIONS)
+    meta["trial_type"] = {
+        "Description": "Type of event.",
+        "Levels": {"spike": "Sorted microwire spike (point event)."},
+    }
+    meta["value"] = {"Description": "Sorting cluster ID for this spike."}
+    meta["SpikeDataNPZ"] = {
+        "Description": (
+            "Companion NumPy archive with waveforms, movie-aligned times, firing-rate bins, "
+            "and downsampled continuous micro."
+        ),
+        "Filename": f"{new_prefix}_spikedata.npz",
+        "Arrays": SPIKE_DATA_NPZ_SCHEMA,
+    }
+    meta["SpikeWaveformsNPY"] = {
+        "Description": "float32 (n_spikes, n_waveform_samples); duplicate of waveforms in SpikeDataNPZ.",
+        "Filename": f"{new_prefix}_spikewaveforms.npy",
+    }
+    meta["desc"] = {"Description": "Channel label embedded in filename.", "Value": desc}
+    return meta
+
+
+def _collect_channel_descs(ieeg_dir: Path) -> set[str]:
+    descs: set[str] = set()
+    for p in ieeg_dir.iterdir():
+        if p.is_file():
+            d = _parse_desc_from_name(p.name)
+            if d:
+                descs.add(d)
+    return descs
+
+
+def align_spike_derivatives(
+    deriv_root: Path,
+    subject: str,
+    session: str,
+    task: str,
+    acq: str,
+    run: str,
+    dry_run: bool = False,
+    delete_old: bool = False,
+) -> int:
+    """
+    Post-hoc rename of legacy *_spikes.tsv → *_events.tsv with proper BIDS entities.
+    Returns number of channels aligned.
+    """
+    ieeg_dir = deriv_root / f"sub-{subject}" / f"ses-{session}" / "ieeg"
+    if not ieeg_dir.is_dir():
+        raise FileNotFoundError(f"Missing derivatives ieeg dir: {ieeg_dir}")
+
+    descs = sorted(_collect_channel_descs(ieeg_dir))
+    if not descs:
+        print(f"No desc-* channel files found under {ieeg_dir}")
+        return 0
+
+    print(f"Found {len(descs)} channels under {ieeg_dir}")
+    n_ok = 0
+    for desc in descs:
+        new_prefix = f"sub-{subject}_ses-{session}_task-{task}_acq-{acq}_run-{run}_desc-{desc}"
+        legacy_tsv  = list(ieeg_dir.glob(f"*_desc-{desc}_spikes.tsv"))
+        legacy_json = list(ieeg_dir.glob(f"*_desc-{desc}_spikes.json"))
+        legacy_wf   = list(ieeg_dir.glob(f"*_desc-{desc}_spikewaveforms.npy"))
+        legacy_npz  = list(ieeg_dir.glob(f"*_desc-{desc}_spikedata.npz"))
+
+        new_tsv  = ieeg_dir / f"{new_prefix}_events.tsv"
+        if new_tsv.exists() and not legacy_tsv:
+            continue
+        if not legacy_tsv:
+            continue
+
+        old_tsv       = legacy_tsv[0]
+        old_json_path = legacy_json[0] if legacy_json else None
+        old_wf        = legacy_wf[0]   if legacy_wf   else None
+        old_npz       = legacy_npz[0]  if legacy_npz  else None
+        new_json = ieeg_dir / f"{new_prefix}_events.json"
+        new_wf   = ieeg_dir / f"{new_prefix}_spikewaveforms.npy"
+        new_npz  = ieeg_dir / f"{new_prefix}_spikedata.npz"
+
+        if dry_run:
+            print(f"  [dry-run] {desc}: {old_tsv.name} -> {new_tsv.name}")
+            if old_wf:
+                print(f"            {old_wf.name} -> {new_wf.name}")
+            if old_npz:
+                print(f"            {old_npz.name} -> {new_npz.name}")
+            n_ok += 1
+            continue
+
+        df = pd.read_csv(old_tsv, sep="\t")
+        _spikes_tsv_to_events_tsv(df).to_csv(new_tsv, sep="\t", index=False, float_format="%.6f")
+
+        old_json = json.loads(old_json_path.read_text()) if old_json_path and old_json_path.is_file() else None
+        with open(new_json, "w") as f:
+            json.dump(_build_events_json(old_json, new_prefix, desc), f, indent=2)
+
+        for old, new in ((old_wf, new_wf), (old_npz, new_npz)):
+            if old and old != new:
+                if new.exists():
+                    new.unlink()
+                shutil.move(str(old), str(new))
+
+        if new_npz.is_file():
+            z = np.load(new_npz, allow_pickle=True)
+            kw = {k: z[k] for k in z.files}
+            z.close()
+            kw["channel"] = np.array(desc)
+            np.savez_compressed(new_npz, **kw)
+
+        if delete_old:
+            for p in (old_tsv, old_json_path):
+                if p and p.is_file() and p != new_tsv and p != new_json:
+                    p.unlink()
+            for legacy in ieeg_dir.glob(f"*_desc-{desc}_spikes.*"):
+                if legacy.is_file():
+                    legacy.unlink()
+
+        print(f"  aligned {desc} -> {new_tsv.name}")
+        n_ok += 1
+
+    # Update dataset_description.json
+    desc_path = deriv_root / "dataset_description.json"
+    payload = {
+        "Name": "Sorted microwire spikes (movie window, pipeline times_*)",
+        "BIDSVersion": "1.10.0",
+        "DatasetType": "derivative",
+        "GeneratedBy": [{"Name": "ucla2bids", "Version": "0.2.0",
+            "Description": (
+                "Exports sorted spikes from times_*.mat for the full audio-aligned movie. "
+                "Each channel has BIDS-style events.tsv (trial_type=spike), JSON sidecars, "
+                "spikewaveforms.npy, and spikedata.npz."
+            )}],
+        "SourceDatasets": json.loads(desc_path.read_text()).get("SourceDatasets", []) if desc_path.exists() else [],
+    }
+    if dry_run:
+        print(f"[dry-run] Would update {desc_path}")
+    else:
+        with open(desc_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Updated {desc_path}")
+
+    print(f"Done. Aligned {n_ok} channel(s).")
+    if dry_run:
+        print("Re-run without --align-dry-run to apply changes.")
+    return n_ok
 
 
 def write_spike_derivatives_dataset_description(
@@ -965,13 +1187,15 @@ def write_spike_derivatives(
         bids_root, subject, session, task, run, acqs=("micro", "macro")
     )
 
-    movie_duration: float | None = None
+    movie_duration: float | None = None       # neural-clock duration (for time-window filter + micro extraction)
+    movie_duration_video: float | None = None  # video-frame-time duration (for firing-rate bins + NPZ)
     drift_multiplier = 1.0
     if time_window == "movie":
         if feature_events_csv is None:
             raise ValueError("feature_events_csv is required when time_window='movie'")
         _, drift_multiplier = get_movie_alignment_seconds(audio_align_json)
-        movie_duration = _movie_duration_in_recording(feature_events_csv, drift_multiplier)
+        movie_duration_video = _movie_duration_video(feature_events_csv)
+        movie_duration = movie_duration_video * drift_multiplier
     elif time_window != "recording":
         raise ValueError(f"Unsupported time_window: {time_window}")
 
@@ -1012,26 +1236,37 @@ def write_spike_derivatives(
             single_units_only=single_units_only,
             time_window=time_window,
             movie_duration=movie_duration,
+            drift_multiplier=drift_multiplier,
         )
         if spikes.empty:
             n_skipped += 1
             continue
 
         desc = channel_to_desc(channel)
-        prefix = f"sub-{subject}_ses-{session}_task-{task}_desc-{desc}_spikes"
-        tsv_path = deriv_ieeg_dir / f"{prefix}.tsv"
-        json_path = deriv_ieeg_dir / f"{prefix}.json"
-        wave_npy_path = deriv_ieeg_dir / f"{prefix.replace('_spikes', '_spikewaveforms')}.npy"
-        npz_path = deriv_ieeg_dir / f"{prefix.replace('_spikes', '_spikedata')}.npz"
+        prefix = f"sub-{subject}_ses-{session}_task-{task}_acq-micro_run-{run}_desc-{desc}"
+        tsv_path      = deriv_ieeg_dir / f"{prefix}_events.tsv"
+        json_path     = deriv_ieeg_dir / f"{prefix}_events.json"
+        wave_npy_path = deriv_ieeg_dir / f"{prefix}_spikewaveforms.npy"
+        npz_path      = deriv_ieeg_dir / f"{prefix}_spikedata.npz"
 
-        spikes.to_csv(tsv_path, sep="\t", index=False, float_format="%.6f")
+        events_df = spikes.copy()
+        events_df["trial_type"] = "spike"
+        events_df["value"] = events_df["cluster_id"].astype(int)
+        lead = ["onset", "duration", "trial_type", "value"]
+        events_df = events_df[lead + [c for c in events_df.columns if c not in lead]]
+        events_df.to_csv(tsv_path, sep="\t", index=False, float_format="%.6f")
         if waveforms is not None:
             np.save(wave_npy_path, waveforms)
 
         sr = float(aux_meta.get("sampling_frequency_hz", 32000.0))
-        mov_dur = float(movie_duration if movie_duration is not None else recording_duration)
+        # movie_duration_video: stimulus_time seconds (matches events.tsv stimulus_time column)
+        # movie_duration: neural-clock seconds (used for micro sample extraction)
+        mov_dur_video = float(
+            movie_duration_video if movie_duration_video is not None else recording_duration
+        )
+        mov_dur_neural = float(movie_duration if movie_duration is not None else recording_duration)
         t_movie = spikes["movie_onset"].to_numpy(dtype=np.float64)
-        rate_counts, rate_edges = build_firing_rate_bins(t_movie, mov_dur, raster_hz)
+        rate_counts, rate_edges = build_firing_rate_bins(t_movie, mov_dur_video, raster_hz)
 
         micro_volts = np.zeros(0, dtype=np.float32)
         micro_times = np.zeros(0, dtype=np.float64)
@@ -1039,7 +1274,7 @@ def write_spike_derivatives(
             micro_mat = find_continuous_micro_mat(experiment_dir, channel)
             if micro_mat is not None:
                 rec_start = int(round(movie_start_rel * sr))
-                n_samp = int(round(mov_dur * sr))
+                n_samp = int(round(mov_dur_neural * sr))
                 micro_volts, micro_times = load_movie_micro_downsampled(
                     micro_mat,
                     rec_start,
@@ -1068,13 +1303,26 @@ def write_spike_derivatives(
             sampling_frequency_hz=np.float64(sr),
             movie_start_rel=np.float64(movie_start_rel),
             movie_start_series=np.float64(movie_start_series),
-            movie_duration_sec=np.float64(mov_dur),
+            movie_duration_sec=np.float64(mov_dur_video),
             drift_correction_multiplier=np.float64(drift_multiplier),
             timestampsStart=np.float64(timestamps_start),
         )
 
         metadata = {
             **SPIKE_COLUMN_DESCRIPTIONS,
+            "trial_type": {
+                "Description": "Type of event.",
+                "Levels": {"spike": "Sorted microwire spike (point event)."},
+            },
+            "value": {"Description": "Sorting cluster ID for this spike."},
+            "SpikeDataNPZ": {
+                "Description": (
+                    "Companion NumPy archive with waveforms, movie-aligned times, firing-rate bins, "
+                    "and downsampled continuous micro."
+                ),
+                "Filename": npz_path.name,
+                "Arrays": SPIKE_DATA_NPZ_SCHEMA,
+            },
             "Sources": {
                 "Description": "Raw iEEG recording and manual spike sorting inputs.",
                 "References": [
@@ -1113,8 +1361,9 @@ def write_spike_derivatives(
             },
             "NeuralDataExtraction": {
                 "Description": (
-                    "Primary bundle: load spikedata.npz. Row i waveforms[i]; movie time spike_times_movie[i]. "
-                    "For film-aligned playback use movie_onset with drift_correction_multiplier from JSON."
+                    "Primary bundle: load spikedata.npz. Row i waveforms[i]; "
+                    "spike_times_movie[i] is in stimulus_time (matches events.tsv stimulus_time column). "
+                    "To get neural-clock time: spike_times_movie * drift_correction_multiplier."
                 ),
             },
         }
@@ -1143,9 +1392,9 @@ def write_spike_derivatives(
                 "Value": movie_start_rel,
             }
             metadata["movie_duration"] = {
-                "Description": "Movie duration in recording time (max feature Time * drift multiplier).",
+                "Description": "Movie duration in stimulus_time seconds (max time from feature CSV).",
                 "Units": "s",
-                "Value": movie_duration,
+                "Value": movie_duration_video,
             }
 
         with open(json_path, "w") as f:
@@ -1162,7 +1411,6 @@ def main() -> None:
     parser.add_argument("--bids-root", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/bids"))
     parser.add_argument("--feature-events-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_events_vowel_word_features.csv"))
     parser.add_argument("--phoneme-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_phonemes.csv"))
-    parser.add_argument("--subtitle-srt", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01.srt"))
     parser.add_argument("--characters-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/40m_act_24_S06E01_30fps_characters.csv"))
     parser.add_argument("--concepts-csv", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/24_S06E01_8concepts_merged.csv"))
     parser.add_argument("--audio-align-json", type=Path, default=Path("/store/scratch/bsow/Documents/UCLA_24/data/ucla_data/572/Experiment-9/Audio/572_exp_09_preSleep_movie_24_audio_movie_start_time.json"))
@@ -1229,7 +1477,42 @@ def main() -> None:
         action="store_true",
         help="Include multiunit/noise (manual only); pipeline times_* exports all sorted spikes.",
     )
+
+    # Post-hoc alignment of legacy *_spikes.tsv → *_events.tsv
+    parser.add_argument(
+        "--align-derivatives",
+        action="store_true",
+        help=(
+            "Rename legacy *_spikes.tsv → *_events.tsv under derivatives/spike-sorted/, "
+            "adding acq/run BIDS entities and trial_type/value columns. "
+            "When passed, only alignment runs (no BIDS build)."
+        ),
+    )
+    parser.add_argument("--align-dry-run", action="store_true",
+        help="Preview alignment renames without writing files (use with --align-derivatives).")
+    parser.add_argument("--align-delete-old", action="store_true",
+        help="Delete legacy *_spikes.tsv/json after successful alignment.")
     args = parser.parse_args()
+
+    if args.align_derivatives:
+        align_spike_derivatives(
+            deriv_root=args.bids_root / "derivatives" / SPIKE_PIPELINE_NAME,
+            subject=args.subject,
+            session=args.session,
+            task=args.task,
+            acq="micro",
+            run=args.run,
+            dry_run=args.align_dry_run,
+            delete_old=args.align_delete_old,
+        )
+        return
+
+    if args.spike_include_multiunit and args.spike_times_source == "pipeline":
+        print(
+            "Warning: --spike-include-multiunit has no effect with --spike-times-source pipeline. "
+            "Pipeline times_*.mat files do not store unit_class; all pipeline spikes are assigned "
+            "class 1 (single unit). Use --spike-times-source manual to filter by unit class."
+        )
 
     micro_channels, macro_channels = read_channel_names(args.experiment_dir)
     loc_df = load_localization_sheet(args.localization_xlsx)
@@ -1248,11 +1531,10 @@ def main() -> None:
             )
 
     write_ieeg_metadata(args.bids_root, args.subject, args.session, electrodes_df)
-    events_df = build_events_table(
+    events_df, timing_meta = build_events_table(
         args.feature_events_csv,
         args.audio_align_json,
         args.phoneme_csv,
-        args.subtitle_srt,
         args.characters_csv,
         args.concepts_csv,
     )
@@ -1264,6 +1546,7 @@ def main() -> None:
         args.acqs,
         args.run,
         events_df,
+        timing_meta=timing_meta,
     )
 
     print(f"Wrote electrodes for sub-{args.subject}, ses-{args.session}")

@@ -45,3 +45,10 @@ dinov3/
 
 # Trash
 trash/
+
+# claude
+CLAUDE.md
+
+# slurm
+run*.sh
+*.sh
