@@ -40,8 +40,14 @@ results/
 # DINOv3 model library (submodule / external clone)
 dinov3/
 
+# Data files (numpy, csv)
+*.npz
+data/*.csv
+data/clusterless/
+
 # Slurm logs
 *.out
+*.err
 
 # Trash
 trash/
