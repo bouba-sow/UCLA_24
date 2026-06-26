@@ -57,4 +57,4 @@ CLAUDE.md
 
 # slurm
 run*.sh
-*.sh
+*.sh*.weights

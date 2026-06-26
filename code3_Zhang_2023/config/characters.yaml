@@ -1,0 +1,26 @@
+# Zhang et al. 2023 — nine major characters (stage 3) and top-4 for decoding.
+# Names match the 40m_act CSV convention (Initial.Last).
+
+major_characters:
+  - A.Amar
+  - A.Fayed
+  - B.Buchanan
+  - C.Manning
+  - C.OBrian
+  - J.Bauer
+  - J.Wallace
+  - K.Hayes
+  - M.OBrian
+
+# Subset used for iEEG decoding (paper main analysis)
+decode_characters:
+  - J.Bauer
+  - B.Buchanan
+  - C.OBrian
+  - A.Fayed
+
+# Extra frame-level columns (paper supplementary categories)
+auxiliary_columns:
+  - Face
+  - Person
+  - No Characters

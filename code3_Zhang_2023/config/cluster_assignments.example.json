@@ -1,0 +1,12 @@
+{
+  "_comment": "Map stage-2 cluster IDs to character names (stage 3 human supervision). Copy to cluster_assignments.json and edit.",
+  "0": "J.Bauer",
+  "1": "B.Buchanan",
+  "2": "C.OBrian",
+  "3": "A.Fayed",
+  "4": "A.Amar",
+  "5": "C.Manning",
+  "6": "J.Wallace",
+  "7": "K.Hayes",
+  "8": "M.OBrian"
+}

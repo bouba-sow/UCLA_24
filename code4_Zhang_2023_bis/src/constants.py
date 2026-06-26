@@ -1,0 +1,15 @@
+"""Zhang et al. 2023 — hyperparameters (decoding only, leakage-free CV in code4)."""
+
+FRAME_SUBSAMPLE = 4
+HALF_WINDOW_FRAMES = 30  # ±1 s at 30 Hz → T=60
+DNK_MARGIN = 5
+N_FOLDS = 5
+EPOCHS = 100
+BATCH_SIZE = 256
+LR = 1e-3
+VAL_FRACTION = 0.125
+LSTM_LAYERS = 2
+LSTM_HIDDEN = 128
+WEIGHT_INIT_GAUSS_STD = 0.1
+WEIGHT_INIT_UNIFORM = 0.1
+UNIT_RATE_MIN_HZ = 0.05

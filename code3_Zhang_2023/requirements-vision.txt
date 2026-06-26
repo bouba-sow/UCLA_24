@@ -1,0 +1,10 @@
+# Zhang 2023 vision — Darknet YOLOv3 (vendored PyTorch-YOLOv3, MIT)
+facenet-pytorch>=2.5.3
+filterpy>=1.4.5
+scenedetect>=0.6.4
+PyYAML>=6.0
+scikit-learn>=1.4.0
+scipy>=1.11.0
+
+# Download weights separately:
+#   bash code3_Zhang_2023/scripts/download_yolov3_weights.sh
